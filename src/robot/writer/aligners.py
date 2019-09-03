@@ -13,8 +13,6 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 
-from .dataextractor import DataExtractor
-
 
 class _Aligner(object):
 
@@ -28,7 +26,7 @@ class _Aligner(object):
         for index, col in enumerate(row):
             if len(self._widths) <= index:
                 break
-            row[index] = row[index].ljust(self._widths[index])
+            row[index].value = row[index].value.ljust(self._widths[index])
         return row
 
 
@@ -40,18 +38,21 @@ class FirstColumnAligner(_Aligner):
 
 class ColumnAligner(_Aligner):
 
-    def __init__(self, first_column_width, table):
-        _Aligner.__init__(self, self._count_widths(first_column_width, table))
+    def __init__(self, first_column_width, rows):
+        _Aligner.__init__(self, self._count_widths(first_column_width, rows))
 
-    def _count_widths(self, first_column_width, table):
-        result = [first_column_width] + [len(h) for h in table.header[1:]]
-        for row in DataExtractor().rows_from_table(table):
-            for index, col in enumerate(row[1:]):
+    def align_rows(self, rows):
+        return [self.align_row(r) for r in rows]
+
+    def _count_widths(self, first_column_width, rows):
+        result = [first_column_width] + [len(t.value) for t in rows[0][1:]]
+        for row in rows[1:]:
+            for index, t in enumerate(row[1:]):
                 index += 1
                 if len(result) <= index:
-                    result.append(len(col))
+                    result.append(len(t.value))
                 else:
-                    result[index] = max(len(col), result[index])
+                    result[index] = max(len(t.value), result[index])
         return result
 
 

@@ -15,9 +15,8 @@
 
 import re
 
+from robot.parsing.lexer import Token
 from .aligners import FirstColumnAligner, ColumnAligner, NullAligner
-from .dataextractor import DataExtractor
-from .rowsplitter import RowSplitter
 
 
 class _DataFileFormatter(object):
@@ -25,9 +24,7 @@ class _DataFileFormatter(object):
     _split_multiline_doc = True
 
     def __init__(self, column_count):
-        self._splitter = RowSplitter(column_count, self._split_multiline_doc)
         self._column_count = column_count
-        self._extractor = DataExtractor(self._want_names_on_first_content_row)
 
     def _want_names_on_first_content_row(self, table, name):
         return True
@@ -35,15 +32,22 @@ class _DataFileFormatter(object):
     def empty_row_after(self, table):
         return self._format_row([], table)
 
-    def format_header(self, table):
-        header = self._format_row(table.header)
-        return self._format_header(header, table)
-
-    def format_table(self, table):
-        rows = self._extractor.rows_from_table(table)
-        if self._should_split_rows(table):
-            rows = self._split_rows(rows, table)
-        return (self._format_row(r, table) for r in rows)
+    def format_section(self, section):
+        formatted = []
+        for s in self._format_statement(section, section, recurse=False):
+            formatted.append(s)
+        has_test_or_kw = False
+        for statement in section.statements:
+            if has_test_or_kw and statement.tokens[0].type == Token.NAME:
+                formatted.append([Token(Token.SEPARATOR, '')])
+            if len(statement.tokens) == 1 and statement.tokens[0].type == Token.EOL:
+                continue
+            for row in self._format_statement(section, statement):
+                formatted.append(self._indent(section, row))
+            if statement.tokens[0].type == Token.NAME:
+                has_test_or_kw = True
+        aligner = self._aligner_for(section, formatted)
+        return [aligner.align_row(row) for row in formatted]
 
     def _should_split_rows(self, table):
         return not self._should_align_columns(table)
@@ -53,11 +57,12 @@ class _DataFileFormatter(object):
             for split in self._splitter.split(original, table.type):
                 yield split
 
-    def _should_align_columns(self, table):
-        return self._is_indented_table(table) and bool(table.header[1:])
+    def _should_align_columns(self, section):
+        return self._is_indented_table(section) and len(section.header.tokens) > 2
 
-    def _is_indented_table(self, table):
-        return table is not None and table.type in ['test case', 'keyword']
+    def _is_indented_table(self, section):
+        return section is not None and section.type in [Token.TESTCASE_HEADER,
+                                                        Token.KEYWORD_HEADER]
 
     def _escape_consecutive_whitespace(self, row):
         return [self._whitespace.sub(self._whitespace_escaper,
@@ -72,58 +77,47 @@ class _DataFileFormatter(object):
     def _format_header(self, header, table):
         raise NotImplementedError
 
-
-class TsvFormatter(_DataFileFormatter):
-
-    def _format_header(self, header, table):
-        return [self._format_header_cell(cell) for cell in header]
-
-    def _format_header_cell(self, cell):
-        return '*%s*' % cell if cell else ''
-
-    def _format_row(self, row, table=None):
-        return self._pad(self._escape(row))
-
-    def _escape(self, row):
-        return self._escape_consecutive_whitespace(self._escape_tabs(row))
-
-    def _escape_tabs(self, row):
-        return [c.replace('\t', '\\t') for c in row]
-
-    def _pad(self, row):
-        row = [cell.replace('\n', ' ') for cell in row]
-        return row + [''] * (self._column_count - len(row))
+    def _format_statement(self, section, statement, recurse=True):
+        raise NotImplementedError
 
 
 class TxtFormatter(_DataFileFormatter):
     _test_or_keyword_name_width = 18
     _setting_and_variable_name_width = 14
 
-    def _format_row(self, row, table=None):
-        row = self._escape(row)
-        aligner = self._aligner_for(table)
-        return aligner.align_row(row)
+    def _format_statement(self, section, statement, recurse=True):
+        return list(self._split_to_rows(section, statement, recurse))
 
-    def _aligner_for(self, table):
-        if table and table.type in ['setting', 'variable']:
+    def _indent(self, section, statement):
+        if section.type in [Token.TESTCASE_HEADER, Token.KEYWORD_HEADER] \
+                and statement[0].type != Token.NAME:
+            return [self._empty_token()] + statement
+        return statement
+
+    def _format_row(self, row, section=None):
+        return row
+
+    def _aligner_for(self, section, rows):
+        if section.type in [Token.SETTING_HEADER, Token.VARIABLE_HEADER]:
             return FirstColumnAligner(self._setting_and_variable_name_width)
-        if self._should_align_columns(table):
-            return ColumnAligner(self._test_or_keyword_name_width, table)
+        if self._should_align_columns(section):
+            return ColumnAligner(self._test_or_keyword_name_width, rows)
         return NullAligner()
 
-    def _format_header(self, header, table):
+    def _format_header(self, header, section):
         header = ['*** %s ***' % header[0]] + header[1:]
-        aligner = self._aligner_for(table)
+        aligner = self._aligner_for(section)
         return aligner.align_row(header)
 
-    def _want_names_on_first_content_row(self, table, name):
-        return self._should_align_columns(table) and \
-                len(name) <= self._test_or_keyword_name_width
+    def _want_names_on_first_content_row(self, section, name):
+        return self._should_align_columns(section) and \
+               len(name) <= self._test_or_keyword_name_width
 
     def _escape(self, row):
         if not row:
             return row
-        return list(self._escape_cells(self._escape_consecutive_whitespace(row)))
+        return list(
+            self._escape_cells(self._escape_consecutive_whitespace(row)))
 
     def _escape_cells(self, row):
         escape = False
@@ -133,6 +127,50 @@ class TxtFormatter(_DataFileFormatter):
             elif escape:
                 cell = '\\'
             yield cell
+
+    def _split_to_rows(self, section, statement, recurse=False):
+        tokens_on_row = []
+        for_seen = False
+        in_for_loop = False
+        prev_t = None
+        for t in self._get_tokens(statement, recurse):
+            if t.type == Token.END:
+                for_seen = in_for_loop = False
+            if for_seen and t.type == Token.KEYWORD:
+                in_for_loop = True
+            if t.type == t.SEPARATOR:
+                continue
+            if t.type == t.EOL:
+                if not (prev_t and prev_t.type == Token.NAME and
+                        self._want_names_on_first_content_row(section, prev_t.value)):
+                    if tokens_on_row:
+                        yield tokens_on_row if not in_for_loop else [self._empty_token()] + tokens_on_row
+                    tokens_on_row = []
+                continue
+            if t.type == t.CONTINUATION:
+                if tokens_on_row:
+                    yield tokens_on_row if not in_for_loop else [
+                                                                    self._empty_token()] + tokens_on_row
+                tokens_on_row = [t]
+            else:
+                tokens_on_row.append(t)
+            if not for_seen:
+                for_seen = t.type == Token.FOR
+            prev_t = t
+        if tokens_on_row:
+            yield tokens_on_row if not in_for_loop else [
+                                                            self._empty_token()] + tokens_on_row
+
+    def _get_tokens(self, statement, recurse):
+        for t in statement.tokens:
+            yield t
+        if recurse:
+            for s in statement.statements:
+                for t in s.tokens:
+                    yield t
+
+    def _empty_token(self):
+        return Token(Token.SEPARATOR, '')
 
 
 class PipeFormatter(TxtFormatter):
@@ -151,3 +189,6 @@ class PipeFormatter(TxtFormatter):
         if cell.endswith(' |'):
             cell = cell[:-1] + '\\|'
         return cell
+
+    def _empty_token(self):
+        return Token(Token.SEPARATOR, '  ')

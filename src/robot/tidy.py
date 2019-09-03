@@ -38,8 +38,10 @@ if 'robot' not in sys.modules and __name__ == '__main__':
     import pythonpathsetter
 
 from robot.errors import DataError
-from robot.parsing import (disable_curdir_processing)
-from robot.utils import Application, binary_file_writer, file_writer, PY2
+from robot.parsing import Model
+from robot.utils import Application, file_writer
+from robot.running.builder.suitestructure import SuiteStructureBuilder, SuiteStructureVisitor
+from robot.writer import DataFileWriter
 
 
 USAGE = """robot.tidy -- Robot Framework test data clean-up tool
@@ -55,7 +57,7 @@ Tidy tool can be used to clean up and change format of Robot Framework test
 data files. The output is written into the standard output stream by default,
 but an optional output file can be given as well. Files can also be modified
 in-place using --inplace or --recursive options.
-
+tidy
 Options
 =======
 
@@ -131,7 +133,7 @@ http://robotframework.org/robotframework/#built-in-tools.
 """
 
 
-class Tidy(object):
+class Tidy(SuiteStructureVisitor):
     """Programmatic API for the `Tidy` tool.
 
     Arguments accepted when creating an instance have same semantics as
@@ -155,19 +157,13 @@ class Tidy(object):
         Use :func:`inplace` to tidy files in-place.
         """
         data = self._parse_data(path)
-        with self._get_writer(path, output) as writer:
-            self._save_file(data, writer)
+        with self._get_writer(output) as writer:
+            self._save_file(data, path, writer)
             if not output:
                 return writer.getvalue().replace('\r\n', '\n')
 
-    def _get_writer(self, inpath, outpath):
-        if PY2 and self._is_tsv(inpath):
-            return binary_file_writer(outpath)
+    def _get_writer(self, outpath):
         return file_writer(outpath, newline=self._options['line_separator'])
-
-    def _is_tsv(self, path):
-        format = self._options['format'] or os.path.splitext(path)[1][1:]
-        return format.upper() == 'TSV'
 
     def inplace(self, *paths):
         """Tidy file(s) in-place.
@@ -175,7 +171,7 @@ class Tidy(object):
         :param paths: Paths of the files to to process.
         """
         for path in paths:
-            self._save_file(self._parse_data(path))
+            self._save_file(self._parse_data(path), path)
 
     def directory(self, path):
         """Tidy a directory.
@@ -186,16 +182,13 @@ class Tidy(object):
         """
         self._save_directory(self._parse_data(path))
 
-    @disable_curdir_processing
     def _parse_data(self, path):
         if os.path.isdir(path):
-            return TestDataDirectory(source=path).populate()
-        if self._is_init_file(path):
-            path = os.path.dirname(path)
-            return TestDataDirectory(source=path).populate(recurse=False)
+            return SuiteStructureBuilder(None, None).build([path])
         try:
-            return TestCaseFile(source=path).populate()
+            return Model(path)
         except DataError:
+            raise
             try:
                 return ResourceFile(source=path).populate()
             except DataError:
@@ -204,20 +197,22 @@ class Tidy(object):
     def _is_init_file(self, path):
         return os.path.splitext(os.path.basename(path))[0].lower() == '__init__'
 
-    def _save_file(self, data, output=None):
-        source = data.initfile if self._is_directory(data) else data.source
-        if source and not output:
-            os.remove(source)
-        data.save(output=output, **self._options)
+    def _save_file(self, data, path, output=None):
+        if path and not output:
+             os.remove(path)
+        DataFileWriter(output=output, path=path, **self._options).write(data)
 
     def _save_directory(self, data):
-        if not self._is_directory(data):
-            self._save_file(data)
-            return
-        if data.initfile:
-            self._save_file(data)
-        for child in data.children:
-            self._save_directory(child)
+        data.visit(self)
+
+    def visit_file(self, file):
+        self.inplace(file.source)
+
+    def visit_directory(self, directory):
+        if directory.init_file:
+            self.inplace(directory.init_file)
+        for child in directory.children:
+            child.visit(self)
 
     def _is_directory(self, data):
         return hasattr(data, 'initfile')
